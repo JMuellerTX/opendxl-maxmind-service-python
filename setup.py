@@ -71,8 +71,8 @@ setup(
     install_requires=[
         "requests",
         "maxminddb",
-        "dxlbootstrap>=0.2.0",
-        "dxlclient>=4.1.0.184"
+        "dxlbootstrap @ git+https://github.com/JMuellerTX/opendxl-bootstrap-python@master",
+        "dxlclient @ git+https://github.com/JMuellerTX/opendxl-client-python@epo-legacy"
     ],
 
     tests_require=TEST_REQUIREMENTS,
