@@ -174,7 +174,7 @@ class MaxMindDatabase(object):
             logger.exception("Failed to update MaxMind database.")
         finally:
             # Schedule this function to run again in the configured update interval
-            self._update_thread = Timer(self._update_interval * 60 * 60, self._update_database)
+            self._update_thread = Timer(self._update_interval * 60, self._update_database)
             self._update_thread.daemon = True
             self._update_thread.start()
 

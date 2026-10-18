@@ -59,7 +59,7 @@ class MaxMindHostLookupRequestCallback(RequestCallback):
             res = Response(request)
 
             # Set payload
-            MessageUtils.dict_to_json_payload(res, results)
+            MessageUtils.dict_to_json_payload(res, results or {})
 
             # Send response
             self._app.client.send_response(res)
