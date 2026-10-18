@@ -4,7 +4,7 @@ import os
 from io import BytesIO
 import tarfile
 import logging
-from threading import Timer
+from threading import RLock, Timer
 
 import requests
 import maxminddb
@@ -91,6 +91,8 @@ class MaxMindGeolocationService(Application):
 
     def destroy(self):
         logger.info("Destroying MaxMindGeolocationService...")
+        if self._database is not None:
+            self._database.close()
         super(MaxMindGeolocationService, self).destroy()
 
     @property
@@ -106,6 +108,8 @@ class MaxMindDatabase(object):
     A class to handle IP lookups and updating of the MaxMind Database
     """
 
+    DEFAULT_TIMEOUT = 60
+
     def __init__(self, update_interval, database_path, license_key):
         """
         Initializes the MaxMindDatabase
@@ -114,6 +118,10 @@ class MaxMindDatabase(object):
         :param database_path: The path to a local MaxMind database to be used
         :param license_key: A MaxMind license key
         """
+        self._lock = RLock()
+        self._update_thread = None
+        self._closed = False
+        self._license_key = license_key
         if database_path is not None and database_path != "":
             logger.info("Local database specified. Updates will not be automatically downloaded.")
             if not os.path.isfile(database_path):
@@ -124,7 +132,6 @@ class MaxMindDatabase(object):
         else:
             if license_key is None or license_key == "":
                 raise Exception("A MaxMind license key must be specified.")
-            self._license_key = license_key
             self._database_url = (
                 "https://download.maxmind.com/app/geoip_download" +
                 "?edition_id=GeoLite2-City&license_key=" +
@@ -137,6 +144,30 @@ class MaxMindDatabase(object):
             self._update_interval = update_interval
             self._update_database()
 
+    def _redact(self, message):
+        if not message:
+            return message
+        text = str(message)
+        if self._license_key:
+            text = text.replace(str(self._license_key), "<redacted>")
+        return text
+
+    def close(self):
+        """
+        Cancels any scheduled update timer and closes the database reader.
+        """
+        with self._lock:
+            self._closed = True
+            if self._update_thread is not None:
+                self._update_thread.cancel()
+                self._update_thread = None
+            if self._reader is not None:
+                try:
+                    self._reader.close()
+                except Exception:
+                    pass
+                self._reader = None
+
     def _update_database(self):
         """
         Determines if a database update is needed and if so downloads a new one from MaxMind
@@ -147,36 +178,63 @@ class MaxMindDatabase(object):
             return
 
         logger.info("Checking for MaxMind database updates...")
+        file_descriptor = None
+        file_path = None
+        swapped = False
         try:
             if not self._is_update_needed():
                 logger.info("No database updates to retrieve.")
                 return
 
             logger.info("Retrieving MaxMind Database...")
-            response = requests.get(self._database_url)
+            response = requests.get(self._database_url, timeout=self.DEFAULT_TIMEOUT)
             response.raise_for_status()
             logger.info('Retrieved MaxMind database.')
 
             # Write the database to a temporary file
             file_descriptor, file_path = tempfile.mkstemp()
+            extracted = False
 
             # Find the database in the TAR file
             with tarfile.open(fileobj=BytesIO(response.content), mode="r:gz") as tar:
                 for member in tar.getmembers():
                     if member.name.upper().endswith(".MMDB"):
-                        with os.fdopen(file_descriptor, 'wb') as temp_file:
-                            temp_file.write(tar.extractfile(member.name).read())
+                        member_file = tar.extractfile(member)
+                        if member_file is not None:
+                            with os.fdopen(file_descriptor, 'wb') as temp_file:
+                                file_descriptor = None
+                                temp_file.write(member_file.read())
+                            extracted = True
                         break
 
+            if not extracted:
+                raise Exception("No .mmdb file found in downloaded archive.")
+
             self._swap_database(file_path)
+            swapped = True
             logger.info("MaxMind database updated.")
-        except Exception:
-            logger.exception("Failed to update MaxMind database.")
+        except Exception as ex:
+            logger.error("Failed to update MaxMind database: %s",
+                         self._redact(ex))
         finally:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+            if not swapped and file_path is not None and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
             # Schedule this function to run again in the configured update interval
-            self._update_thread = Timer(self._update_interval * 60, self._update_database)
-            self._update_thread.daemon = True
-            self._update_thread.start()
+            with self._lock:
+                if not self._closed:
+                    if self._update_thread is not None:
+                        self._update_thread.cancel()
+                    self._update_thread = Timer(self._update_interval * 60, self._update_database)
+                    self._update_thread.daemon = True
+                    self._update_thread.start()
 
     def _is_update_needed(self):
         """
@@ -186,7 +244,7 @@ class MaxMindDatabase(object):
         """
 
         # Retrieve the headers of the response to compare the MD5 checksums of the file
-        response = requests.get(self._database_url + ".md5")
+        response = requests.get(self._database_url + ".md5", timeout=self.DEFAULT_TIMEOUT)
         response.raise_for_status()
         response_checksum = response.content
         logger.info("Database MD5 received: %s",
@@ -203,15 +261,25 @@ class MaxMindDatabase(object):
 
         :param new_database_path: The path to the new database
         """
-        # Open the new database
-        self._reader = maxminddb.open_database(new_database_path, maxminddb.const.MODE_MEMORY)
-
-        # Delete the temporary new database file
         try:
-            os.remove(new_database_path)
-        except Exception:
-            logger.exception("Failed to remove old database file.")
-        self._database_checksum = self._response_checksum
+            # Open the new database
+            new_reader = maxminddb.open_database(new_database_path, maxminddb.const.MODE_MEMORY)
+            with self._lock:
+                old_reader = self._reader
+                self._reader = new_reader
+                self._database_checksum = self._response_checksum
+                if old_reader is not None:
+                    try:
+                        old_reader.close()
+                    except Exception:
+                        pass
+        finally:
+            # Delete the temporary new database file
+            try:
+                if os.path.exists(new_database_path):
+                    os.remove(new_database_path)
+            except Exception:
+                logger.exception("Failed to remove old database file.")
 
     def lookup_ip(self, ip): # pylint: disable=invalid-name
         """
@@ -220,6 +288,8 @@ class MaxMindDatabase(object):
         :param ip: The IP or Hostname to look up
         :return: A dictionary of the MaxMind Database response
         """
-        if self._reader is None:
-            raise Exception("MaxMind database not yet initialized.")
-        return self._reader.get(ip)
+        with self._lock:
+            if self._reader is None:
+                raise Exception("MaxMind database not yet initialized.")
+            return self._reader.get(ip)
+

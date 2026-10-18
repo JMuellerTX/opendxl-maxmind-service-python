@@ -42,9 +42,12 @@ class MaxMindHostLookupRequestCallback(RequestCallback):
         try:
             # Retrieve the parameters from the request
             params = MessageUtils.json_payload_to_dict(request)
+            if not isinstance(params, dict):
+                raise ValueError("Request payload must be a JSON object")
 
             if self._PARAM_HOST not in params:
                 raise Exception("Required parameter not specified: '{0}'".format(self._PARAM_HOST))
+
 
             target = params[self._PARAM_HOST]
 

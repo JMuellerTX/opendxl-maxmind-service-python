@@ -51,3 +51,50 @@ class BasicHostLookupExample(unittest.TestCase):
         mock_print.assert_called_with(StringMatches("registered_country"))
         mock_print.assert_called_with(
             StringDoesNotMatch("Error invoking service"))
+
+    def test_update_database_cleans_temp_file_and_redacts_license_key(self):
+        import io
+        import os
+        import tarfile
+        import tempfile
+        from mock import MagicMock
+        from dxlmaxmindservice.app import MaxMindDatabase
+
+        # Create a tar.gz without any .mmdb file
+        tar_buf = io.BytesIO()
+        with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+            info = tarfile.TarInfo(name="README.txt")
+            data = b"not an mmdb"
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        tar_bytes = tar_buf.getvalue()
+
+        created_paths = []
+        orig_mkstemp = tempfile.mkstemp
+
+        def tracking_mkstemp(*args, **kwargs):
+            fd, path = orig_mkstemp(*args, **kwargs)
+            created_paths.append(path)
+            return fd, path
+
+        md5_resp = MagicMock()
+        md5_resp.content = b"abcd1234"
+        md5_resp.raise_for_status = MagicMock()
+
+        tar_resp = MagicMock()
+        tar_resp.content = tar_bytes
+        tar_resp.raise_for_status = MagicMock()
+
+        with patch("dxlmaxmindservice.app.requests.get", side_effect=[md5_resp, tar_resp]), \
+                patch("dxlmaxmindservice.app.tempfile.mkstemp", side_effect=tracking_mkstemp):
+            db = MaxMindDatabase(60, "", "secret-license-key-999")
+            try:
+                self.assertEqual(1, len(created_paths))
+                self.assertFalse(os.path.exists(created_paths[0]))
+                self.assertIsNotNone(db._update_thread)
+                self.assertNotIn("secret-license-key-999",
+                                 db._redact("Error for key secret-license-key-999"))
+            finally:
+                db.close()
+                self.assertIsNone(db._update_thread)
+
